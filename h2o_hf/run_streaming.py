@@ -11,7 +11,7 @@ import re
 import sys
 
 from tqdm import tqdm
-from streaming_llm.utils import load, download_url, load_jsonl
+from utils_real_drop.stream import load, download_url, load_jsonl
 
 from transformers.models.llama.modeling_llama import LlamaAttention
 from utils_real_drop.modify_llama import H2OLlamaAttention_streaming, H2OLlamaForCausalLM_streaming
@@ -94,11 +94,28 @@ def streaming_inference_heavy_hitter(model, tokenizer, prompts, kv_cache=None, m
         past_key_values = greedy_generate(
             model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
         )
+        
+@torch.no_grad()
+def streaming_lsh_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
+    past_key_values = None
+    for idx, prompt in enumerate(prompts):
+        prompt = "USER: " + prompt + "\n\nASSISTANT: "
+        print("\n" + prompt, end="")
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        input_ids = input_ids.to(model.device)
+        seq_len = input_ids.shape[1]
+        if kv_cache is not None:
+            space_needed = seq_len + max_gen_len
+            past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+
+        past_key_values = greedy_generate(
+            model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
+        )
 
 
 def main(args):
     model_name_or_path = args.model_name_or_path
-    model, tokenizer = load(model_name_or_path, args.enable_streaming_with_H2O, args)
+    model, tokenizer = load(model_name_or_path, args.inference_type, args)
     test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
     print(f"Loading data from {test_filepath} ...")
 
@@ -114,7 +131,7 @@ def main(args):
     for sample in list_data:
         prompts += sample["turns"]
 
-    if args.enable_streaming_with_H2O:
+    if args.inference_type == "heavy_hitter":
         kv_cache = None
         streaming_inference_heavy_hitter(
             model,
@@ -122,7 +139,14 @@ def main(args):
             prompts,
             kv_cache,
         )
-
+    elif args.inference_type == "lsh":
+        kv_cache = None
+        streaming_lsh_inference(
+            model,
+            tokenizer,
+            prompts,
+            kv_cache,
+        )
     else:
         kv_cache = None
         streaming_inference(
@@ -136,10 +160,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name_or_path", type=str, default="lmsys/vicuna-13b-v1.3"
+        "--model_name_or_path", type=str, default="huggyllama/llama-7b"
     )
     parser.add_argument("--data_root", type=str, default="data/")
     parser.add_argument("--enable_streaming_with_H2O", action="store_true")
+    parser.add_argument("--inference_type", type=str, default="heavy_hitter")
     parser.add_argument("--start_size", type=int, default=4)
     parser.add_argument("--heavy_hitter_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=2000)

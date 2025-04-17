@@ -11,7 +11,7 @@ import urllib.request
 import os
 import json
 
-from utils_real_drop.modify_llama import H2OLlamaForCausalLM_streaming
+from utils_real_drop.modify_llama import H2OLlamaForCausalLM_streaming, LSHLlamaForCausalLM_streaming
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -54,7 +54,7 @@ def parse_args():
     return args
 
 
-def load(model_name_or_path, heavy_hitter=False, args=None):
+def load(model_name_or_path, inference_type="", args=None):
     print(f"Loading model from {model_name_or_path} ...")
     # however, tensor parallel for running falcon will occur bugs
     tokenizer = AutoTokenizer.from_pretrained(
@@ -67,8 +67,19 @@ def load(model_name_or_path, heavy_hitter=False, args=None):
         config.hh_size = args.heavy_hitter_size
         config.recent_size = args.recent_size
 
-    if heavy_hitter:
+    if inference_type == "heavy_hitter":
+        print("Loading H2O Llama model ...")
         model = H2OLlamaForCausalLM_streaming.from_pretrained(
+        model_name_or_path,
+        device_map="auto",
+        config=config,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    elif inference_type == "lsh":
+        print("Loading LSH Llama model ...")
+        config.batch_size = 1
+        model = LSHLlamaForCausalLM_streaming.from_pretrained(
         model_name_or_path,
         device_map="auto",
         config=config,
