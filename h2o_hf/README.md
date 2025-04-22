@@ -38,6 +38,9 @@ bash scripts/streaming/eval.sh full
 
 # H2O
 bash scripts/streaming/eval.sh h2o
+
+# LSH
+bash scripts/streaming/eval.sh lsh
 ```
 
 ### Benchmarking on summarization tasks with real KV dropping implementation
