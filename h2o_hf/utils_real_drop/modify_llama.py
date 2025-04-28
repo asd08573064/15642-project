@@ -765,7 +765,7 @@ class H2OLlamaForCausalLM_streaming(LlamaForCausalLM):
             
             
 class MultiHeadLSHFilter:
-    def __init__(self, embed_size_per_head, n_buckets, threshold, batch_size, num_heads, device='cuda', n_hashes=4, random_rotations_per_head=False, rehash_each_round=True, drop_for_hash_rate=0.0):
+    def __init__(self, embed_size_per_head, n_buckets, threshold, batch_size, num_heads, most_recent_seq_len=10, device='cuda', n_hashes=8, random_rotations_per_head=False, rehash_each_round=True, drop_for_hash_rate=0.0):
         """
         LSH Cache adapted for multi-head attention format
         """
@@ -779,6 +779,7 @@ class MultiHeadLSHFilter:
         self.threshold = threshold
         self.batch_size = batch_size
         self.num_heads = num_heads
+        self.most_recent_seq_len = most_recent_seq_len
         assert n_buckets % 2 == 0
 
         # Create random rotations for each head
@@ -803,7 +804,7 @@ class MultiHeadLSHFilter:
         if not random_rotations_per_head:
             # Expand to apply the same rotations to each head
             self.random_rotations = self.random_rotations.expand(batch_size, num_heads, -1, -1, -1)
-            
+
         self.buckets = None
         self.seq_lens = []  # Track sequence lengths for each cache update
 
@@ -817,7 +818,7 @@ class MultiHeadLSHFilter:
         # 'bhsf,bhfki->bhksi' means:
         # b: batch, h: heads, s: sequence, f: features, k: hashes, i: buckets
         rotated_keys = torch.einsum('bhsf,bhfki->bhksi', keys, self.random_rotations)
-        
+
         if self.rehash_each_round:
             # Create positive and negative versions for each vector for balanced bucketing
             rotated_keys = torch.cat([rotated_keys, -rotated_keys], dim=-1)
@@ -831,10 +832,10 @@ class MultiHeadLSHFilter:
             bucket_range = bucket_range.expand_as(rotated_keys)
 
             # Sort key-val implementation
-            _, indices = rotated_keys.sort(dim=-1)
+            values, indices = rotated_keys.sort(dim=-1)
             bucket_range = bucket_range.expand_as(rotated_keys)
             buckets = bucket_range.gather(dim=-1, index=indices)
-            
+
             # buckets size [batch size, num_heads, seq_len, buckets]
             buckets = buckets[..., -self.n_hashes:].permute(0, 1, 3, 2)  # [batch, heads, hashes, seq_len]
 
@@ -845,50 +846,43 @@ class MultiHeadLSHFilter:
 
         return buckets  # [batch_size, num_heads, n_hashes, seq_len]
 
+
     def _get_from_cache(self, query):
         """
         Retrieve relevant key-value pairs from the cache based on query
         """
         if self.buckets is None:
             return None, None, None
-        
+
         # Hash the query
         query_buckets = self._hash_keys(query)  # [batch_size, num_heads, n_hashes, seq_len]
-        
-        # Reshape for comparison
-        # Need to compare each query bucket with all cache buckets
-        # query_buckets: [batch_size, num_heads, n_hashes, query_seq_len]
-        # self.buckets: [batch_size, num_heads, n_hashes, cache_seq_len]
-        
+
         # Expand dimensions for broadcasting
         # [batch_size, num_heads, n_hashes, query_seq_len, 1]
         q_buckets_expanded = query_buckets.unsqueeze(-1)
         # [batch_size, num_heads, n_hashes, 1, cache_seq_len]
         c_buckets_expanded = self.buckets.unsqueeze(-2)
-        
+
         # Compare buckets
         # [batch_size, num_heads, n_hashes, query_seq_len, cache_seq_len]
         bucket_matches = (q_buckets_expanded == c_buckets_expanded)
-        
+
         # Count hits across hash functions
         # [batch_size, num_heads, query_seq_len, cache_seq_len]
         count_hit_hashes = bucket_matches.sum(dim=2)
-        
+
         # Find indices where hits exceed threshold
         # [batch_size, num_heads, query_seq_len, cache_seq_len]
         indices = count_hit_hashes >= self.threshold
-        
-        # Apply attention sink (i.e. always keep the first token)
-        indices[:, :, 0, :] = True
-        
-        return indices
+        # print(indices) 
+       
 
+        return indices
+    
     def add(self, keys):
         """
         Add key-value pairs to the cache
         """
-        
-        
         # Hash the new keys
         new_buckets = self._hash_keys(keys)
         self.seq_lens.append(keys.shape[2])  # Store the sequence length
@@ -908,32 +902,38 @@ class MultiHeadLSHFilter:
         
         bzs = query.shape[0]
         _, _, cache_len, _ = past_key.shape
-        
         # Get attention mask from LSH
         indices = self._get_from_cache(query)  # [batch_size, num_heads, query_seq_len, cache_seq_len]
-        
-        
+
         def at_least_k_true(tensor, k, dim=1):
             """Check if there are at least k True values along specified dimension"""
-            tensor = tensor.sum(dim=dim) >= k
+            tensor = (tensor.sum(dim=dim) >= k).unsqueeze(-1)
+            # print(tensor)
             return tensor  # Keep original dimensionality
         
-        indices = at_least_k_true(indices, k=6).unsqueeze(-1).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
+        
+        
+        indices = at_least_k_true(indices, k=28).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
+        
+        
+        # Apply attention sink (i.e. always keep the first token)
+        indices[:, :, 0, :] = True
+        
+        # Keep the most recent window of tokens
+        indices[:, :,  -self.most_recent_seq_len:, :] = True
+        
+        
         
         filtered_keys = torch.masked_select(past_key, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
         filtered_values = torch.masked_select(past_value, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
-        
+        # print("Before filtering keys and values:", past_key.shape, past_value.shape)
+        # print("After filtering keys and values:", filtered_keys.shape, filtered_values.shape)
         return filtered_keys, filtered_values
-        
-    def bucket_exists(self):
-        """Check if any buckets exist in the cache"""
-        return self.buckets is not None
-
 
     def clear_cache(self):
         """Clear the entire cache"""
         self.buckets = None
-        self.seq_lens = []    
+        self.seq_lens = [] 
         
 def generate_attention_mask(
     bsz: int, 
@@ -993,11 +993,11 @@ class LSHLlamaAttention_streaming(nn.Module):
         
         self.lsh_filter = MultiHeadLSHFilter(
             embed_size_per_head=self.head_dim,
-            n_buckets=16,
+            n_buckets=128,
             threshold=2,
             batch_size=config.batch_size,
             num_heads=self.num_heads,
-            n_hashes=16,
+            n_hashes=64,
             random_rotations_per_head=True,
         )
 
@@ -1030,6 +1030,9 @@ class LSHLlamaAttention_streaming(nn.Module):
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def _clean_cache(self):
+        self.lsh_filter.clear_cache()
 
     def forward(
         self,
@@ -1126,8 +1129,15 @@ class LSHLlamaAttention_streaming(nn.Module):
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, filtered_kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, filtered_kv_seq_len)}, but is {attention_mask.size()}"
+                # raise ValueError(
+                #     f"Attention mask should be of size {(bsz, 1, q_len, filtered_kv_seq_len)}, but is {attention_mask.size()}"
+                # )
+                attention_mask = generate_attention_mask(
+                    bsz=bsz,
+                    query_seq_len=q_len,
+                    key_seq_len=filtered_kv_seq_len,
+                    dtype=query_states.dtype,
+                    device=query_states.device,
                 )
             attn_weights = attn_weights + attention_mask
 
