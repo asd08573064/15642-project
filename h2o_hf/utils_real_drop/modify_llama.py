@@ -233,7 +233,6 @@ class H2OKVCache_LayerWise:
         k_seq_dim=2,
         v_seq_dim=2,
     ):
-        print(f"H2OKVCache-LayerWise: {hh_size}, {recent_size}")
         self.hh_size = hh_size
         self.recent_size = recent_size
         self.cache_size = hh_size + recent_size
@@ -812,19 +811,7 @@ class MultiHeadLSHFilter:
         """
         Hash keys for LSH attention
         """
-        batch_size, num_heads, seq_len, embed_dim = keys.shape
         device = keys.device
-
-        # Apply dropout
-        if self.drop_for_hash_rate > 0:
-            dropout_mask = torch.dropout(
-                torch.ones_like(keys), 
-                p=self.drop_for_hash_rate, 
-                train=True
-            )
-            dropped_keys = keys * dropout_mask
-        else:
-            dropped_keys = keys
 
         # Apply random rotations - note the einsum pattern has changed to include heads
         # 'bhsf,bhfki->bhksi' means:
@@ -844,7 +831,7 @@ class MultiHeadLSHFilter:
             bucket_range = bucket_range.expand_as(rotated_keys)
 
             # Sort key-val implementation
-            values, indices = rotated_keys.sort(dim=-1)
+            _, indices = rotated_keys.sort(dim=-1)
             bucket_range = bucket_range.expand_as(rotated_keys)
             buckets = bucket_range.gather(dim=-1, index=indices)
             
@@ -857,21 +844,6 @@ class MultiHeadLSHFilter:
         buckets = buckets + offsets
 
         return buckets  # [batch_size, num_heads, n_hashes, seq_len]
-
-    def _add_to_cache(self, keys):
-        """
-        Add key-value pairs to the cache
-        """
-        # Hash the new keys
-        new_buckets = self._hash_keys(keys)
-        self.seq_lens.append(keys.shape[2])  # Store the sequence length
-        
-        # Add to existing cache or initialize if empty
-        if self.buckets is None:
-            self.buckets = new_buckets
-        else:
-            # Concatenate along the sequence length dimension (dim=2)
-            self.buckets = torch.cat([self.buckets, new_buckets], dim=3)  # Buckets has seq_len in dim=3
 
     def _get_from_cache(self, query):
         """
@@ -906,57 +878,52 @@ class MultiHeadLSHFilter:
         # [batch_size, num_heads, query_seq_len, cache_seq_len]
         indices = count_hit_hashes >= self.threshold
         
+        # Apply attention sink (i.e. always keep the first token)
+        indices[:, :, 0, :] = True
+        
         return indices
+
+    def add(self, keys):
+        """
+        Add key-value pairs to the cache
+        """
+        
+        
+        # Hash the new keys
+        new_buckets = self._hash_keys(keys)
+        self.seq_lens.append(keys.shape[2])  # Store the sequence length
+        
+        # Add to existing cache or initialize if empty
+        if self.buckets is None:
+            self.buckets = new_buckets
+        else:
+            # Concatenate along the sequence length dimension (dim=2)
+            self.buckets = torch.cat([self.buckets, new_buckets], dim=3)  # Buckets has seq_len in dim=3
+            
     
-    def __call__(self, query, keys, values):
+    def get(self, query, past_key_value=None):
+        
+        past_key, past_value = past_key_value if past_key_value is not None else (None, None)
+        
+        
         bzs = query.shape[0]
-        _, _, cache_len, _ = keys.shape
-        assert keys.shape == values.shape, "Keys and values must have the same shape"
-        self._add_to_cache(keys[:, :, -1:, :])
+        _, _, cache_len, _ = past_key.shape
         
         # Get attention mask from LSH
         indices = self._get_from_cache(query)  # [batch_size, num_heads, query_seq_len, cache_seq_len]
         
-        # print(keys[:, :, -1:, :].shape, indices.shape)
         
         def at_least_k_true(tensor, k, dim=1):
             """Check if there are at least k True values along specified dimension"""
-            # print(tensor.shape, k)
             tensor = tensor.sum(dim=dim) >= k
-            # print(tensor.shape, k)
             return tensor  # Keep original dimensionality
         
-        indices = at_least_k_true(indices, k=5).unsqueeze(-1).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
+        indices = at_least_k_true(indices, k=6).unsqueeze(-1).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
         
-        # print(indices)
-        # Filter keys and values based on indices
-        # print(indices.shape)
-        filtered_keys = torch.masked_select(keys, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
-        filtered_values = torch.masked_select(values, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
-        
-        
-        # Create a boolean mask for positions we want to keep
-        # keep_mask = indices.any(dim=1)  # [batch_size, query_seq_len, cache_seq_len]
-        
-        # # print("dim check", keep_mask.shape, query.shape, keys.shape, values.shape)
-        
-        # # Filter keys and values based on indices
-        # expanded_mask = keep_mask.unsqueeze(-1).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
-        # filtered_keys = torch.masked_select(keys, expanded_mask).view(bzs, self.num_heads, -1, self.embed_size_per_head)
-        # filtered_values = torch.masked_select(values, expanded_mask).view(bzs, self.num_heads, -1, self.embed_size_per_head)
-        
-        # print(f"before filter {keys.shape} {values.shape}")
-        # print(f"after filter {filtered_keys.shape} {filtered_values.shape}")
-        
-        # Add just the new key(s) to the cache - the last token(s) in the sequence
-        
-        # print(keys.shape, values.shape, filtered_keys.shape, filtered_values.shape)
+        filtered_keys = torch.masked_select(past_key, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
+        filtered_values = torch.masked_select(past_value, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
         
         return filtered_keys, filtered_values
-    
-    def prefill(self, keys):
-        # print("prefilling")
-        self._add_to_cache(keys)
         
     def bucket_exists(self):
         """Check if any buckets exist in the cache"""
@@ -997,240 +964,6 @@ def generate_attention_mask(
     mask = mask.expand(bsz, 1, query_seq_len, key_seq_len).to(dtype)
     
     return mask
-            
-            
-# class LSHLlamaAttention_streaming(nn.Module):
-#     """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-#     def __init__(self, config: LlamaConfig):
-#         super().__init__()
-#         self.config = config
-#         self.hidden_size = config.hidden_size
-#         self.num_heads = config.num_attention_heads
-#         self.head_dim = self.hidden_size // self.num_heads
-#         self.num_key_value_heads = config.num_key_value_heads
-#         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-#         self.max_position_embeddings = config.max_position_embeddings
-#         self.rope_theta = config.rope_theta
-
-#         if (self.head_dim * self.num_heads) != self.hidden_size:
-#             raise ValueError(
-#                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-#                 f" and `num_heads`: {self.num_heads})."
-#             )
-#         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-#         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-#         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-#         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-#         self._init_rope()
-
-#         self.lsh_filter = MultiHeadLSHFilter(
-#             embed_size_per_head=self.head_dim,
-#             n_buckets=32,
-#             threshold=2,
-#             batch_size=config.batch_size,
-#             num_heads=self.num_heads,
-#             n_hashes=64,
-#             random_rotations_per_head=True,
-#         )
-
-#     def _init_rope(self):
-#         if self.config.rope_scaling is None:
-#             self.rotary_emb = LlamaRotaryEmbedding(
-#                 self.head_dim,
-#                 max_position_embeddings=self.max_position_embeddings,
-#                 base=self.rope_theta,
-#             )
-#         else:
-#             scaling_type = self.config.rope_scaling["type"]
-#             scaling_factor = self.config.rope_scaling["factor"]
-#             if scaling_type == "linear":
-#                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-#                     self.head_dim,
-#                     max_position_embeddings=self.max_position_embeddings,
-#                     scaling_factor=scaling_factor,
-#                     base=self.rope_theta,
-#                 )
-#             elif scaling_type == "dynamic":
-#                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-#                     self.head_dim,
-#                     max_position_embeddings=self.max_position_embeddings,
-#                     scaling_factor=scaling_factor,
-#                     base=self.rope_theta,
-#                 )
-#             else:
-#                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-
-#     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-#         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-#     def _clean_cache(self):
-#         self.lsh_filter.clear_cache()
-
-#     def forward(
-#         self,
-#         hidden_states: torch.Tensor,
-#         attention_mask: Optional[torch.Tensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-#         output_attentions: bool = False,
-#         use_cache: bool = False,
-#     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        
-#         bsz, q_len, _ = hidden_states.size()
-        
-#         # Project inputs to queries, keys, values
-#         query_states = self.q_proj(hidden_states)
-#         key_states = self.k_proj(hidden_states)
-#         value_states = self.v_proj(hidden_states)
-        
-#         # Reshape for multi-head attention
-#         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-#         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-#         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        
-#         # Calculate total KV sequence length including past
-#         kv_seq_len = key_states.shape[-2]
-#         if past_key_value is not None:
-#             kv_seq_len += past_key_value[0].shape[-2]
-        
-#         # Apply rotary position embeddings
-#         position_length = kv_seq_len
-#         if not position_ids.nelement() > 1:
-#             if position_length < position_ids.item()+1:
-#                 position_length = position_ids.item()+1
-        
-#         cos, sin = self.rotary_emb(value_states, seq_len=position_length)
-#         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
-#         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
-        
-#         # Concatenate past keys and values if available
-#         if past_key_value is not None:
-#             key_states = torch.cat([past_key_value[0], key_states], dim=2)
-#             value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        
-#         # Store current keys and values for next iteration
-#         past_key_value = (key_states, value_states) if use_cache else None
-        
-#         # Apply LSH filtering to keys and values
-#         # if past_key_value is not None:
-#         #     if not self.lsh_filter.bucket_exists():
-#         #         # First call - just prefill
-#         #         self.lsh_filter.prefill(key_states)
-#         #         filtered_key_states, filtered_value_states = key_states, value_states
-#         #     else:
-#         #         # Get filtered keys and values
-#         #         filtered_key_states, filtered_value_states = self.lsh_filter(query_states, key_states, value_states)
-#         # else:
-#         filtered_key_states, filtered_value_states = key_states, value_states
-        
-#         # Get filtered sequence length
-#         filtered_kv_len = filtered_key_states.shape[2]
-        
-#         # Create appropriate attention mask for the filtered sequence
-#         attention_mask = generate_attention_mask(
-#             bsz=bsz,
-#             query_seq_len=q_len,
-#             key_seq_len=filtered_kv_len,
-#             dtype=query_states.dtype,
-#             device=query_states.device
-#         )
-        
-#         # Repeat KV heads if necessary
-#         key_states = repeat_kv(filtered_key_states, self.num_key_value_groups)
-#         value_states = repeat_kv(filtered_value_states, self.num_key_value_groups)
-        
-#         # Compute attention scores
-#         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-#         # Apply attention mask
-#         if attention_mask is not None:
-#             attn_weights = attn_weights + attention_mask
-        
-#         # Softmax and compute attention outputs
-#         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-#         attn_output = torch.matmul(attn_weights, value_states)
-        
-#         # Reshape output
-#         attn_output = attn_output.transpose(1, 2).contiguous()
-#         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        
-#         # Project output
-#         attn_output = self.o_proj(attn_output)
-        
-#         return attn_output, None if not output_attentions else attn_weights, past_key_value
-    
-# class LSHLlamaDecoderLayer(nn.Module):
-#     def __init__(self, original_layer):
-#         super().__init__()
-#         # Copy all attributes from the original layer
-#         self.hidden_size = original_layer.hidden_size
-#         self.self_attn = original_layer.self_attn  # Replace with LSH attention
-#         self.mlp = original_layer.mlp
-#         self.input_layernorm = original_layer.input_layernorm
-#         self.post_attention_layernorm = original_layer.post_attention_layernorm
-
-#     def forward(
-#         self,
-#         hidden_states: torch.Tensor,
-#         attention_mask: Optional[torch.Tensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-#         output_attentions: Optional[bool] = False,
-#         use_cache: Optional[bool] = False,
-#         **kwargs,
-#     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-#         """
-#         Args:
-#             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-#             attention_mask (`torch.FloatTensor`, *optional*):
-#                 attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
-#                 query_sequence_length, key_sequence_length)` if default attention is used.
-#             output_attentions (`bool`, *optional*):
-#                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-#                 returned tensors for more detail.
-#             use_cache (`bool`, *optional*):
-#                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-#                 (see `past_key_values`).
-#             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-#         """
-#         if "padding_mask" in kwargs:
-#             warnings.warn(
-#                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-#             )
-
-#         residual = hidden_states
-
-#         hidden_states = self.input_layernorm(hidden_states)
-
-#         # Self Attention
-#         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-#             hidden_states=hidden_states,
-#             attention_mask=attention_mask,
-#             position_ids=position_ids,
-#             past_key_value=past_key_value,
-#             output_attentions=output_attentions,
-#             use_cache=use_cache,
-#             **kwargs,
-#         )
-        
-#         hidden_states = residual + hidden_states
-
-#         # Fully Connected
-#         residual = hidden_states
-#         hidden_states = self.post_attention_layernorm(hidden_states)
-#         hidden_states = self.mlp(hidden_states)
-#         hidden_states = residual + hidden_states
-
-#         outputs = (hidden_states,)
-
-#         if output_attentions:
-#             outputs += (self_attn_weights,)
-
-#         if use_cache:
-#             outputs += (present_key_value,)
-
-#         return outputs
 
 class LSHLlamaAttention_streaming(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -1260,11 +993,11 @@ class LSHLlamaAttention_streaming(nn.Module):
         
         self.lsh_filter = MultiHeadLSHFilter(
             embed_size_per_head=self.head_dim,
-            n_buckets=32,
+            n_buckets=16,
             threshold=2,
             batch_size=config.batch_size,
             num_heads=self.num_heads,
-            n_hashes=64,
+            n_hashes=16,
             random_rotations_per_head=True,
         )
 
@@ -1308,6 +1041,7 @@ class LSHLlamaAttention_streaming(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -1346,42 +1080,54 @@ class LSHLlamaAttention_streaming(nn.Module):
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
+        # add query_states and key_states to LSH filter cache
 
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        
-        
-        
-        if past_key_value is not None:
-            if not self.lsh_filter.bucket_exists():
-                # First call - just prefill
-                self.lsh_filter.prefill(key_states)
-                filtered_key_states, filtered_value_states = key_states, value_states
-            else:
-                # Get filtered keys and values
-                filtered_key_states, filtered_value_states = self.lsh_filter(query_states, key_states, value_states)
-        else:
-            filtered_key_states, filtered_value_states = key_states, value_states
             
-        filtered_kv_len = filtered_key_states.shape[2]
+        # get filtered keys and values from LSH filter cache
+        if q_len == 1:
+            filtered_keys, filtered_values = self.lsh_filter.get(query_states, past_key_value)
+        else:
+            filtered_keys, filtered_values = key_states, value_states
+        
+        self.lsh_filter.add(query_states)
+        
+        
+        # get the filtered kv_seq_len
+        filtered_kv_seq_len = filtered_keys.shape[-2]
+        
+        # generate attention mask
+        if attention_mask is None:
+            attention_mask = generate_attention_mask(
+                bsz=bsz,
+                query_seq_len=q_len,
+                key_seq_len=filtered_kv_seq_len,
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
 
         past_key_value = (key_states, value_states) if use_cache else None
-        key_states = repeat_kv(filtered_key_states, self.num_key_value_groups)
-        value_states = repeat_kv(filtered_value_states, self.num_key_value_groups)
+
+        key_states = repeat_kv(filtered_keys, self.num_key_value_groups)
+        value_states = repeat_kv(filtered_values, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if attn_weights.size() != (bsz, self.num_heads, q_len, filtered_kv_len):
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, filtered_kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, filtered_kv_len)}, but is"
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, filtered_kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
             )
 
+
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, filtered_kv_len):
+            if attention_mask.size() != (bsz, 1, q_len, filtered_kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, filtered_kv_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size {(bsz, 1, q_len, filtered_kv_seq_len)}, but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
 
@@ -1417,6 +1163,10 @@ class LSHLlamaForCausalLM_streaming(LlamaForCausalLM):
         num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
             self.model.layers[layer_idx].self_attn = LSHLlamaAttention_streaming(config)
+            
+    def clear_filter_cache(self):
+        for layer in self.model.layers:
+            layer.self_attn.lsh_filter.clear_cache()
 
 
 
