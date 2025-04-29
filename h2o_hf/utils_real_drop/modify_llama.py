@@ -764,6 +764,25 @@ class H2OLlamaForCausalLM_streaming(LlamaForCausalLM):
             self.model.layers[layer_idx].self_attn = H2OLlamaAttention_streaming(config)
             
             
+class DropRateMeter:
+    def __init__(self):
+        self.drop_count = 0
+        self.original_count = 0
+
+    def update(self, droppped_count, original_count):
+        self.drop_count += droppped_count
+        self.original_count += original_count
+
+    def get_drop_rate(self):
+        if self.original_count == 0:
+            return 0.0
+        return 1 - self.drop_count / self.original_count
+    
+    def reset(self):
+        self.drop_count = 0
+        self.original_count = 0
+            
+            
 class MultiHeadLSHFilter:
     def __init__(self, embed_size_per_head, n_buckets, threshold, batch_size, num_heads, most_recent_seq_len=10, device='cuda', n_hashes=8, random_rotations_per_head=False, rehash_each_round=True, drop_for_hash_rate=0.0):
         """
@@ -780,6 +799,7 @@ class MultiHeadLSHFilter:
         self.batch_size = batch_size
         self.num_heads = num_heads
         self.most_recent_seq_len = most_recent_seq_len
+        self.drop_rate_meter = DropRateMeter()
         assert n_buckets % 2 == 0
 
         # Create random rotations for each head
@@ -895,7 +915,7 @@ class MultiHeadLSHFilter:
             self.buckets = torch.cat([self.buckets, new_buckets], dim=3)  # Buckets has seq_len in dim=3
             
     
-    def get(self, query, past_key_value=None):
+    def get(self, query, past_key_value=None, k=28):
         
         past_key, past_value = past_key_value if past_key_value is not None else (None, None)
         
@@ -913,7 +933,7 @@ class MultiHeadLSHFilter:
         
         
         
-        indices = at_least_k_true(indices, k=28).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
+        indices = at_least_k_true(indices, k=k).expand(bzs, self.num_heads, cache_len, self.embed_size_per_head)
         
         
         # Apply attention sink (i.e. always keep the first token)
@@ -928,12 +948,16 @@ class MultiHeadLSHFilter:
         filtered_values = torch.masked_select(past_value, indices).view(bzs, self.num_heads, -1, self.embed_size_per_head)
         # print("Before filtering keys and values:", past_key.shape, past_value.shape)
         # print("After filtering keys and values:", filtered_keys.shape, filtered_values.shape)
+        
+        # update drop meter
+        self.drop_rate_meter.update(droppped_count=filtered_keys.shape[2], original_count=past_key.shape[2])
         return filtered_keys, filtered_values
 
     def clear_cache(self):
         """Clear the entire cache"""
         self.buckets = None
         self.seq_lens = [] 
+        self.drop_rate_meter.reset()
         
 def generate_attention_mask(
     bsz: int, 
@@ -993,11 +1017,12 @@ class LSHLlamaAttention_streaming(nn.Module):
         
         self.lsh_filter = MultiHeadLSHFilter(
             embed_size_per_head=self.head_dim,
-            n_buckets=128,
-            threshold=2,
+            n_buckets=config.n_buckets,
+            threshold=config.threshold,
             batch_size=config.batch_size,
             num_heads=self.num_heads,
-            n_hashes=64,
+            n_hashes=config.n_hashes,
+            most_recent_seq_len=config.most_recent_seq_len,
             random_rotations_per_head=True,
         )
 
@@ -1033,6 +1058,9 @@ class LSHLlamaAttention_streaming(nn.Module):
 
     def _clean_cache(self):
         self.lsh_filter.clear_cache()
+        
+    def get_drop_rate(self):
+        return self.lsh_filter.drop_rate_meter.get_drop_rate()
 
     def forward(
         self,
@@ -1093,7 +1121,7 @@ class LSHLlamaAttention_streaming(nn.Module):
             
         # get filtered keys and values from LSH filter cache
         if q_len == 1:
-            filtered_keys, filtered_values = self.lsh_filter.get(query_states, past_key_value)
+            filtered_keys, filtered_values = self.lsh_filter.get(query_states, past_key_value, k=self.config.k)
         else:
             filtered_keys, filtered_values = key_states, value_states
         
