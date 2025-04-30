@@ -763,24 +763,27 @@ class H2OLlamaForCausalLM_streaming(LlamaForCausalLM):
         for layer_idx in range(num_layers):
             self.model.layers[layer_idx].self_attn = H2OLlamaAttention_streaming(config)
             
-            
+import numpy as np        
+
 class DropRateMeter:
     def __init__(self):
-        self.drop_count = 0
-        self.original_count = 0
+        self.drop_count = []
+        self.original_count = []
 
     def update(self, droppped_count, original_count):
-        self.drop_count += droppped_count
-        self.original_count += original_count
+        # self.drop_count += droppped_count
+        # self.original_count += original_count
+        self.drop_count.append(droppped_count)
+        self.original_count.append(original_count)
 
     def get_drop_rate(self):
-        if self.original_count == 0:
+        if len(self.drop_count) == 0:
             return 0.0
-        return 1 - self.drop_count / self.original_count
+        return 1 - sum(self.drop_count) / sum(self.original_count)
     
     def reset(self):
-        self.drop_count = 0
-        self.original_count = 0
+        self.drop_count = []
+        self.original_count = []
             
             
 class MultiHeadLSHFilter:
@@ -957,7 +960,14 @@ class MultiHeadLSHFilter:
         """Clear the entire cache"""
         self.buckets = None
         self.seq_lens = [] 
+    
+    def clear_drop_rate_meter(self):
+        """Clear the drop rate meter"""
         self.drop_rate_meter.reset()
+        
+    def get_drop_rate_statistics(self):
+        """Get the drop rate statistics"""
+        return self.drop_rate_meter.get_drop_rate()
         
 def generate_attention_mask(
     bsz: int, 
@@ -1059,8 +1069,12 @@ class LSHLlamaAttention_streaming(nn.Module):
     def _clean_cache(self):
         self.lsh_filter.clear_cache()
         
-    def get_drop_rate(self):
-        return self.lsh_filter.drop_rate_meter.get_drop_rate()
+    def _clear_drop_rate_meter(self):
+        self.lsh_filter.clear_drop_rate_meter()
+        
+    def get_drop_rate_stats(self):
+        return self.lsh_filter.get_drop_rate_statistics()
+
 
     def forward(
         self,
