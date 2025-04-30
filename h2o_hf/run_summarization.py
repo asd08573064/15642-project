@@ -7,7 +7,7 @@ import torch
 import copy
 from copy import deepcopy
 import dataclasses
-from xopen import xopen
+# from xopen import xopen
 import math
 import matplotlib.pyplot as plt 
 
@@ -15,16 +15,16 @@ from rouge import Rouge
 import logging
 import numpy as np
 
-from lost_in_the_middle.prompting import (
-    Document,
-    get_closedbook_qa_prompt,
-    get_qa_prompt,
-    get_qa_prompt_index
-)
+# from lost_in_the_middle.prompting import (
+#     Document,
+#     get_closedbook_qa_prompt,
+#     get_qa_prompt,
+#     get_qa_prompt_index
+# )
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from transformers.models.llama.configuration_llama import LlamaConfig
-from utils_real_drop.modify_llama import H2OLlamaForCausalLM, H2OLlamaAttention
+# from transformers.models.llama.configuration_llama import LlamaConfig
+from utils_real_drop.modify_llama import H2OLlamaForCausalLM, H2OLlamaAttention, LSHLlamaForCausalLM_streaming, LSHLlamaAttention_streaming
 
 
 
@@ -57,15 +57,21 @@ if __name__ == '__main__':
     parser.add_argument("--output_path", type=str, default="")
 
     parser.add_argument("--model_name", type=str, default="")
-    parser.add_argument("--cache_dir", type=str, default=None)
 
     parser.add_argument("--hh_size", type=int, default=1024)
     parser.add_argument("--recent_size", type=int, default=1024)
 
-    parser.add_argument('--enable_h2o_cache', action='store_true')
+    parser.add_argument("--inference_type", type=str, default="h2o")
+    ## LSH KV-Cache
+    parser.add_argument("--num_buckets", type=int, default=64)
+    parser.add_argument("--threshold", type=int, default=2)
+    parser.add_argument("--num_hashes", type=int, default=32)
+    parser.add_argument("--most_recent_seq_len", type=int, default=128)
+    parser.add_argument("--num_heads", type=int, default=32)
+    parser.add_argument("--k_lsh", type=int, default=16)
+    parser.add_argument("--k", type=int, default=0)
 
     parser.add_argument("--sample_num", type=int, default=100)
-    parser.add_argument("--k", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
     parser.add_argument("--no_cuda", action="store_true", help="Avoid using CUDA when available")
     parser.add_argument("--batch_size", type=int, default=1)
@@ -84,20 +90,39 @@ if __name__ == '__main__':
     input_path = args.input_path
     output_path = args.output_path
 
-    config = AutoConfig.from_pretrained(model_name, cache_dir=args.cache_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=args.cache_dir)
+    config = AutoConfig.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
     if args.batch_size>1:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if args.enable_h2o_cache:
+    if args.inference_type == "h2o":
         print('Enabling H2O KV cache')
         config.hh_size = args.hh_size
         config.recent_size = args.recent_size
-        model = ENABLE_Heavy_Hitter_FUNCTIONS['llama_h2o'].from_pretrained(model_name, config=config,
-                                                                            cache_dir=args.cache_dir)
+        model = ENABLE_Heavy_Hitter_FUNCTIONS['llama_h2o'].from_pretrained(model_name, config=config, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+    elif args.inference_type == "lsh":
+        print('Enabling LSH KV cache')
+        config.batch_size = 1
+        config.n_buckets = args.num_buckets
+        config.threshold = args.threshold
+        config.n_hashes = args.num_hashes
+        config.most_recent_seq_len = args.most_recent_seq_len
+        config.num_heads = args.num_heads
+        config.k = args.k_lsh
+        print("Loading model with LSH KV cache")
+        print("num_buckets: {}, threshold: {}, num_hashes: {}, most_recent_seq_len: {}, num_heads: {}, k_lsh: {}".format(
+            args.num_buckets, args.threshold, args.num_hashes, args.most_recent_seq_len, args.num_heads, args.k_lsh))
+        model = LSHLlamaForCausalLM_streaming.from_pretrained(
+            args.model_name,
+            device_map="auto",
+            config=config,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        )
+        print("Model loaded")
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=args.cache_dir)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
 
     model.half().eval().cuda()
 
@@ -139,9 +164,14 @@ if __name__ == '__main__':
                 return_dict_in_generate=True, output_scores=True,
             )
 
-            if args.enable_h2o_cache:
+            if  args.inference_type == "h2o":   
                 for name, m in model.named_modules():
                     if isinstance(m, TAGET_MODULE['llama_h2o']):
+                        m._clean_cache()
+                        
+            elif args.inference_type == "lsh":
+                for name, m in model.named_modules():
+                    if isinstance(m, LSHLlamaAttention_streaming):
                         m._clean_cache()
 
             tokens = tokenizer.convert_ids_to_tokens(output_sequences['sequences'].squeeze(0))[len(input_ids[0]):]
@@ -150,13 +180,25 @@ if __name__ == '__main__':
 
             generate_text = tokenizer.decode(output_sequences['sequences'].squeeze(0)[len(input_ids[0]):])
             generate_text = generate_text[: generate_text.find(stop[0])]
+            
+            print('Prompt: {}'.format(prompt))
+            print('Label: {}'.format(label))
+            print('Generated: {}'.format(generate_text))
 
             scores = rouge.get_scores(generate_text, label)[0]
             rouge1_score_list.append(scores['rouge-1']['f'])
             rouge2_score_list.append(scores['rouge-2']['f'])
             rougel_score_list.append(scores['rouge-l']['f'])
 
+            
+            drop_rate_stats = {}
+            
             result['result'] = {
+                "metrics": {
+                    "rouge-1": scores['rouge-1']['f'],
+                    "rouge-2": scores['rouge-2']['f'],
+                    "rouge-l": scores['rouge-l']['f']
+                },
                 "choices": [
                     {
                         "text": generate_text,
@@ -171,12 +213,31 @@ if __name__ == '__main__':
                 ], 
                 "request_time": {
                     "batch_time": 0, 
-                    "batch_size": 1}
+                    "batch_size": 1
+                },
+                "drop_rate_stats": drop_rate_stats
             }
             
-            results.append(result)
+            if args.inference_type == "lsh":
+                for name, m in model.named_modules():
+                    if isinstance(m, LSHLlamaAttention_streaming):
+                        # print out drop rate for each layer
+                        stats = m.get_drop_rate_stats()
+                        drop_rate_stats[name] = stats
+                        print('Layer {} Drop Rate: {}'.format(name, stats))
+                        m._clear_drop_rate_meter()
+                result['result']['drop_rate_stats'] = drop_rate_stats
+                        
+          
+            
             print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
+                        
+            results.append(result)
+            
 
     with open(output_path, 'w') as f:
         for result in results:
             f.write(json.dumps(result) + '\n')
+    with open(output_path + '.rouge', 'w') as f:
+        f.write('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
+    print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))

@@ -43,6 +43,14 @@ def parse_args():
     parser.add_argument("--start_size", type=int, default=1)
     parser.add_argument("--recent_size", type=int, default=255)
     parser.add_argument("--enable_pos_shift", action="store_true")
+    
+    ## LSH KV-Cache
+    parser.add_argument("--num_buckets", type=int, default=64)
+    parser.add_argument("--threshold", type=int, default=2)
+    parser.add_argument("--num_hashes", type=int, default=32)
+    parser.add_argument("--most_recent_seq_len", type=int, default=128)
+    parser.add_argument("--num_heads", type=int, default=32)
+    parser.add_argument("--k", type=int, default=16)
 
     parser.add_argument("--num_eval_tokens", type=int, default=None)
 
@@ -79,6 +87,12 @@ def load(model_name_or_path, inference_type="", args=None):
     elif inference_type == "lsh":
         print("Loading LSH Llama model ...")
         config.batch_size = 1
+        config.n_buckets = 64
+        config.threshold = 2
+        config.n_hashes = 32
+        config.most_recent_seq_len = 128
+        config.num_heads = 32
+        config.k = 16
         model = LSHLlamaForCausalLM_streaming.from_pretrained(
         model_name_or_path,
         device_map="auto",
